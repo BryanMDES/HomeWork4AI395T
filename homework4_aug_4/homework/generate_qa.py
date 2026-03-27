@@ -111,12 +111,11 @@ def draw_detections(
         x2_scaled = int(x2 * scale_x)
         y2_scaled = int(y2 * scale_y)
 
-        # Skip if bounding box is too small
-        if (x2_scaled - x1_scaled) < min_box_size or (y2_scaled - y1_scaled) < min_box_size:
-            continue
+        visible_w = min(x2_scaled, img_width) - max(x1_scaled, 0)
+        visible_h = min(y2_scaled, img_height) - max(y1_scaled, 0)
 
-        if x2_scaled < 0 or x1_scaled > img_width or y2_scaled < 0 or y1_scaled > img_height:
-            continue
+        if visible_w <= 2 or visible_h <= 2:
+          continue
 
         # Get color for this object type
         if track_id == 0:
@@ -160,15 +159,18 @@ def extract_kart_objects(
         return []
 
     view_detections = data["detections"][view_index]
-    kart_objects = []
+    #kart_objects = []
+
+    #seen_ids = set()
+
+    best_boxes = {}
 
     for det in view_detections:
         class_id, track_id, x1, y1, x2, y2 = det
 
         if class_id != 1:
-            continue
+          continue
 
-        # Scale bbox coordinates from original image size to current image size
         scale_x = img_width / ORIGINAL_WIDTH
         scale_y = img_height / ORIGINAL_HEIGHT
 
@@ -176,14 +178,28 @@ def extract_kart_objects(
         y1_scaled = y1 * scale_y
         x2_scaled = x2 * scale_x
         y2_scaled = y2 * scale_y
+        
+        # Visibility check
+        visible_w = min(x2_scaled, img_width) - max(x1_scaled, 0)
+        visible_h = min(y2_scaled, img_height) - max(y1_scaled, 0)
 
-        # Skip tiny boxes
-        if (x2_scaled - x1_scaled) < min_box_size or (y2_scaled - y1_scaled) < min_box_size:
-            continue
+        if visible_w <= 0 or visible_h <= 0:
+          continue
 
-        # Skip boxes fully outside image
-        if x2_scaled < 0 or x1_scaled > img_width or y2_scaled < 0 or y1_scaled > img_height:
-            continue
+        # Area AFTER scaling
+        area = (x2_scaled - x1_scaled) * (y2_scaled - y1_scaled)
+
+        if track_id not in best_boxes or area > best_boxes[track_id]["area"]:
+          best_boxes[track_id] = {
+            "bbox": (x1_scaled, y1_scaled, x2_scaled, y2_scaled),
+            "area": area
+        }
+
+    kart_objects = []
+
+    for track_id, item in best_boxes.items():
+        x1_scaled, y1_scaled, x2_scaled, y2_scaled = item["bbox"]
+
         center_x = (x1_scaled + x2_scaled) / 2
         center_y = (y1_scaled + y2_scaled) / 2
 
@@ -203,18 +219,17 @@ def extract_kart_objects(
     image_center_y = img_height / 2
 
     best_idx = min(
-        range(len(kart_objects)),
-        key=lambda i: (kart_objects[i]["center"][0] - image_center_x) ** 2
-        + (kart_objects[i]["center"][1] - image_center_y) ** 2,
-    )
+      range(len(kart_objects)),
+      key=lambda i: (
+        (kart_objects[i]["center"][0] - image_center_x) ** 2 +
+        (kart_objects[i]["center"][1] - image_center_y) ** 2
+    ))
 
     for i in range(len(kart_objects)):
         kart_objects[i]["is_center_kart"] = i == best_idx
 
     return kart_objects
-    
 
-    
 def extract_track_info(info_path: str) -> str:
     """
     Extract track information from the info.json file.
@@ -319,7 +334,7 @@ def generate_qa_pairs(info_path: str, view_index: int, img_width: int = 150, img
         kart_name = kart["kart_name"]
 
         lr = "left" if x < ego_x else "right"
-        fb = "front" if y < ego_y else "behind"
+        fb = "front" if y < ego_y else "back"
 
         if lr == "left":
             left_count += 1
@@ -348,7 +363,7 @@ def generate_qa_pairs(info_path: str, view_index: int, img_width: int = 150, img
         qa_pairs.append(
             {
                 "question": f"Where is {kart_name} relative to the ego car?",
-                "answer": f"{fb} {lr}",
+                "answer": f"{fb} and {lr}",
             }
         )
 
