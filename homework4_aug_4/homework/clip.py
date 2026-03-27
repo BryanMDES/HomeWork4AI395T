@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 import torch.nn as nn
 import torchvision as tv
 from peft import LoraConfig, TaskType, get_peft_model
@@ -80,12 +81,28 @@ class CaptionDatasetForTraining(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
         item = self.dataset[idx]
-        image = Image.open(item["image_path"]).convert("RGB")
-        pixel_values = self.image_processor(image)
-        text = item["caption"] + self.processor.tokenizer.eos_token
-        text_inputs = self.processor(text=text, return_tensors="pt", padding=True, truncation=True)
+
+        raw_path = item["image_path"]
+        image_path = Path(raw_path)
+        if not image_path.exists():
+          fixed_path = raw_path.replace("data/data/", "data/")
+          image_path = Path(fixed_path)
+      
+        image = Image.open(image_path).convert("RGB")
+
+        pixel_values = self.processor.image_processor(
+          images=image,
+          return_tensors="pt"
+        )["pixel_values"].squeeze(0)
+        text = item["caption"]
+        text_inputs = self.processor(
+        text=text,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,)
+
         input_ids = text_inputs["input_ids"].squeeze(0).long()
-        attention_mask = text_inputs["attention_mask"].squeeze(0)
+        attention_mask = text_inputs["attention_mask"].squeeze(0).long()
         return {
             "pixel_values": pixel_values,
             "input_ids": input_ids,
@@ -101,14 +118,39 @@ class CLIP(nn.Module):
         super().__init__()
         self.vision_encoder = vision_encoder
         self.text_encoder = text_encoder
-        # TODO: implement the rest components
-        raise NotImplementedError("Not implemented")
+        self.temperature = temperature
+
+        vision_hidden_size = vision_encoder.config.hidden_size
+        text_hidden_size = text_encoder.config.hidden_size
+
+        self.vision_projection = nn.Linear(vision_hidden_size, proj_dim)
+        self.text_projection = nn.Linear(text_hidden_size, proj_dim)
 
     def encode_image(self, image: torch.Tensor) -> torch.Tensor:
-        return self.vision_encoder(image)
+      vision_outputs = self.vision_encoder(pixel_values=image)
 
-    def encode_text(self, text: str) -> torch.Tensor:
-        return self.text_encoder(text)
+      if hasattr(vision_outputs, "pooler_output") and vision_outputs.pooler_output is not None:
+        image_features = vision_outputs.pooler_output
+      else:
+        image_features = vision_outputs.last_hidden_state[:, 0]
+
+      image_embeddings = self.vision_projection(image_features)
+      image_embeddings = F.normalize(image_embeddings, dim=-1)
+      return image_embeddings
+
+    def encode_text(self, text: dict[str, torch.Tensor]) -> torch.Tensor:
+      text_outputs = self.text_encoder(**text)
+      hidden = text_outputs.last_hidden_state          # [B, L, H]
+      attention_mask = text["attention_mask"]          # [B, L]
+
+      mask = attention_mask.unsqueeze(-1).to(hidden.dtype)   # [B, L, 1]
+      summed = (hidden * mask).sum(dim=1)                    # [B, H]
+      counts = mask.sum(dim=1).clamp(min=1e-6)               # [B, 1]
+      text_features = summed / counts                        # [B, H]
+
+      text_embeddings = self.text_projection(text_features)
+      text_embeddings = F.normalize(text_embeddings, dim=-1)
+      return text_embeddings
 
     def save_pretrained(self, save_directory: str, **kwargs):
         """Customize save method, save additional parameters"""
@@ -180,8 +222,22 @@ class CLIP(nn.Module):
         Returns:
             TODO: think about the what values should be returned
         """
-        raise NotImplementedError("Not implemented")
+        image_embeddings = self.encode_image(pixel_values)
+        text_embeddings = self.encode_text({
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,})
 
+        loss = None
+
+        if image_embeddings.shape[0] == text_embeddings.shape[0]:
+          logits = (image_embeddings @ text_embeddings.T) / self.temperature
+          target = torch.arange(image_embeddings.shape[0], device=logits.device)
+
+          loss_i = F.cross_entropy(logits, target)
+          loss_t = F.cross_entropy(logits.T, target)
+          loss = (loss_i + loss_t) / 2
+
+        return image_embeddings, text_embeddings, loss
 
 def compute_clip_loss(
     outputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
@@ -199,7 +255,8 @@ def compute_clip_loss(
     Returns:
         The loss for the CLIP model.
     """
-    raise NotImplementedError("Not implemented")
+    _,_, loss = outputs
+    return loss
 
 
 def get_target_modules_for_lora(model: nn.Module) -> list[str]:
@@ -219,7 +276,7 @@ def get_target_modules_for_lora(model: nn.Module) -> list[str]:
 def train(
     data_dir: Path | None = None,
     output_dir: str = "clip",
-    num_train_epochs: float = 0.05,  # for debugging purpose, increase this once the dry run works
+    num_train_epochs: float = .01,  # for debugging purpose, increase this once the dry run works
     per_device_train_batch_size: int = 1024,
     gradient_accumulation_steps: int = 1,
     learning_rate: float = 5e-4,
@@ -277,7 +334,7 @@ def train(
         save_steps=50,
         save_total_limit=2,
         label_names=["labels"],
-        dataloader_num_workers=num_workers,
+        dataloader_num_workers=0,
     )
 
     trainer = Trainer(
@@ -292,7 +349,7 @@ def train(
 
     # save model
     trainer.save_model(output_dir)
-    model.model.save_pretrained(output_dir)
+    model.base_model.model.save_pretrained(output_dir)
 
     writer.close()
 
