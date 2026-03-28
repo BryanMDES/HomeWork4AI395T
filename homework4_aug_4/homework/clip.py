@@ -50,8 +50,16 @@ def clip_data_collator(features: list[dict[str, torch.Tensor]]) -> dict[str, tor
     def pad_tensor(tensor, pad_value):
         return torch.cat([tensor, torch.full((max_length - tensor.shape[0],), pad_value, dtype=tensor.dtype)])
 
-    input_ids = torch.stack([pad_tensor(f["input_ids"], pad_value=processor.tokenizer.eos_token_id) for f in features])
+    pad_id = processor.tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = processor.tokenizer.eos_token_id
+
+    input_ids = torch.stack([pad_tensor(f["input_ids"], pad_value=pad_id) for f in features])
     attention_mask = torch.stack([pad_tensor(f["attention_mask"], pad_value=0) for f in features])
+
+    for i, f in enumerate(features):
+      assert f["pixel_values"].ndim == 3, f"Feature {i} pixel_values shape: {f['pixel_values'].shape}"
+    
     pixel_values = torch.stack([f["pixel_values"] for f in features])  # assume all are same shape
     labels = torch.stack([pad_tensor(f["labels"], pad_value=-100) for f in features])
 
@@ -68,12 +76,10 @@ class CaptionDatasetForTraining(Dataset):
         self.dataset = dataset
         self.image_processor = tv.transforms.Compose(
             [
-                tv.transforms.Resize(192),
-                tv.transforms.RandomResizedCrop(192, scale=(0.5, 1.0)),
-                tv.transforms.ToTensor(),
-                tv.transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-            ]
-        )
+        tv.transforms.Resize((192, 192)),
+        tv.transforms.ToTensor(),
+        tv.transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+    ])
         self.processor = processor
 
     def __len__(self):
@@ -89,11 +95,8 @@ class CaptionDatasetForTraining(Dataset):
           image_path = Path(fixed_path)
       
         image = Image.open(image_path).convert("RGB")
+        pixel_values = self.image_processor(image)
 
-        pixel_values = self.processor.image_processor(
-          images=image,
-          return_tensors="pt"
-        )["pixel_values"].squeeze(0)
         text = item["caption"]
         text_inputs = self.processor(
         text=text,
@@ -119,6 +122,7 @@ class CLIP(nn.Module):
         self.vision_encoder = vision_encoder
         self.text_encoder = text_encoder
         self.temperature = temperature
+        #self.logit_scale = nn.Parameter(torch.tensor(0.0))
 
         vision_hidden_size = vision_encoder.config.hidden_size
         text_hidden_size = text_encoder.config.hidden_size
@@ -231,6 +235,7 @@ class CLIP(nn.Module):
 
         if image_embeddings.shape[0] == text_embeddings.shape[0]:
           logits = (image_embeddings @ text_embeddings.T) / self.temperature
+          #logits = (image_embeddings @ text_embeddings.T) * self.logit_scale.exp()
           target = torch.arange(image_embeddings.shape[0], device=logits.device)
 
           loss_i = F.cross_entropy(logits, target)
@@ -276,11 +281,11 @@ def get_target_modules_for_lora(model: nn.Module) -> list[str]:
 def train(
     data_dir: Path | None = None,
     output_dir: str = "clip",
-    num_train_epochs: float = .01,  # for debugging purpose, increase this once the dry run works
-    per_device_train_batch_size: int = 1024,
-    gradient_accumulation_steps: int = 1,
+    num_train_epochs: float = .05,  # for debugging purpose, increase this once the dry run works
+    per_device_train_batch_size: int = 64,
+    gradient_accumulation_steps: int = 8,
     learning_rate: float = 5e-4,
-    num_workers: int = 16,
+    num_workers: int = 0,
 ):
     vlm = BaseVLM()
 
@@ -335,6 +340,8 @@ def train(
         save_total_limit=2,
         label_names=["labels"],
         dataloader_num_workers=0,
+        remove_unused_columns=False,
+        dataloader_pin_memory=False,
     )
 
     trainer = Trainer(
@@ -373,33 +380,53 @@ def test(ckpt_path: str, val_dataset: str = "valid_grader"):
 
     testset = MultiChoiceQADataset(val_dataset)
 
+    #clip = load(ckpt_path)
+    #clip = clip.model.to(device)
     clip = load(ckpt_path)
-    clip = clip.model.to(device)
+    clip = clip.to(device)
+    clip.eval()
 
     image_processor = tv.transforms.Compose(
         [
-            tv.transforms.Resize(192),
-            tv.transforms.CenterCrop(192),
-            tv.transforms.ToTensor(),
-            tv.transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-        ]
-    )
+        tv.transforms.Resize((192, 192)),
+        tv.transforms.ToTensor(),
+        tv.transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),])
 
     correct_count = 0
     total_count = 0
 
     for pair in tqdm.tqdm(testset):
         image = Image.open(pair["image_path"]).convert("RGB")
-        pixel_values = image_processor(image).unsqueeze(0).to(device).bfloat16()
-        text_inputs = processor(
-            text=[s + processor.tokenizer.eos_token for s in pair["candidates"]],
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-        )
-        input_ids = text_inputs["input_ids"].long().to(device)
-        attention_mask = text_inputs["attention_mask"].to(device)
-        vision_feature, text_feature, _ = clip(pixel_values, input_ids, attention_mask)
+        #pixel_values = image_processor(image).unsqueeze(0).to(device).bfloat16()
+        pixel_values = image_processor(image).unsqueeze(0).to(device)
+        if device == "cuda":
+          pixel_values = pixel_values.to(dtype=torch.bfloat16)
+        #text_inputs = processor(
+            #text=[s + processor.tokenizer.eos_token for s in pair["candidates"]],
+         #   text=pair["candidates"],
+         #   return_tensors="pt",
+         #   padding=True,
+         #   truncation=True,
+        #)
+        all_input_ids = []
+        all_attention_masks = []
+        for candidate in pair["candidates"]:
+          text_inputs = processor(text=candidate, return_tensors="pt", truncation=True)
+          all_input_ids.append(text_inputs["input_ids"].squeeze(0))
+          all_attention_masks.append(text_inputs["attention_mask"].squeeze(0))
+
+        max_len = max(t.shape[0] for t in all_input_ids)
+        pad_id = processor.tokenizer.pad_token_id or processor.tokenizer.eos_token_id
+        input_ids = torch.stack([F.pad(t, (0, max_len - t.shape[0]), value=pad_id) for t in all_input_ids]).long().to(device)
+        attention_mask = torch.stack([F.pad(t, (0, max_len - t.shape[0]), value=0) for t in all_attention_masks]).to(device)
+        
+        #input_ids = text_inputs["input_ids"].long().to(device)
+        #attention_mask = text_inputs["attention_mask"].to(device)
+        #vision_feature, text_feature, _ = clip(pixel_values, input_ids, attention_mask)
+        vision_feature, text_feature, _ = clip(
+          pixel_values=pixel_values,
+          input_ids=input_ids,
+          attention_mask=attention_mask,)
         prediction = torch.matmul(vision_feature, text_feature.T).argmax(dim=-1)
         if prediction == pair["correct_index"]:
             correct_count += 1
