@@ -62,6 +62,13 @@ def generate_caption(info_path: str, view_index: int, img_width: int = 150, img_
 
       captions.append(f"{kart_name} is {vertical} and {horizontal} of the ego car.")
 
+    other_karts = [k for k in kart_objects if not k["is_center_kart"]]
+    if other_karts:
+        others_str = ", ".join(k["kart_name"] for k in other_karts[:3])
+        captions.append(f"{ego_name} is racing on the {track_name} track with {others_str} nearby.")
+    else:
+        captions.append(f"{ego_name} is racing alone on the {track_name} track.")
+        
     return captions
 
 def check_caption(info_file: str, view_index: int):
