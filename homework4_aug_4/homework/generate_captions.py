@@ -68,6 +68,18 @@ def generate_caption(info_path: str, view_index: int, img_width: int = 150, img_
         captions.append(f"{ego_name} is racing on the {track_name} track with {others_str} nearby.")
     else:
         captions.append(f"{ego_name} is racing alone on the {track_name} track.")
+
+    # Full scene position summary
+    if other_karts:
+      position_parts = []
+      for kart in other_karts[:3]:
+        kart_name = kart["kart_name"]
+        x, y = kart["center"]
+        horizontal = "left" if x < ego_x else "right"
+        vertical = "front" if y < ego_y else "back"
+        position_parts.append(f"{kart_name} to the {vertical} {horizontal}")
+      positions_str = ", ".join(position_parts)
+      captions.append(f"On the {track_name} track, {ego_name} is the ego car with {positions_str}.")
         
     return captions
 
